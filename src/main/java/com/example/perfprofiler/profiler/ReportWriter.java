@@ -40,7 +40,7 @@ public final class ReportWriter {
         String ts = FMT.format(Instant.now());
         Path file = dir.resolve("profiler-report-" + ts + ".txt");
 
-        StringBuilder sb = new StringBuilder(64 * 1024);
+        StringBuilder sb = new StringBuilder();
         sb.append("================================================================================\n");
         sb.append("Performance Profiler Report\n");
         sb.append("Generated: ").append(Instant.now()).append('\n');
@@ -49,18 +49,23 @@ public final class ReportWriter {
 
         sb.append("### ENVIRONMENT\n");
         RuntimeMXBean rt = ManagementFactory.getRuntimeMXBean();
-        sb.append("Java: ").append(System.getProperty("java.version"))
-                .append(" (").append(System.getProperty("java.vendor")).append(")\n");
+        sb.append("Java: ").append(System.getProperty("java.version")).append(" (")
+                .append(System.getProperty("java.vendor")).append(")\n");
         sb.append("JVM: ").append(rt.getVmName()).append(' ').append(rt.getVmVersion()).append('\n');
         sb.append("OS: ").append(System.getProperty("os.name")).append(' ')
                 .append(System.getProperty("os.version")).append(" / ")
                 .append(System.getProperty("os.arch")).append('\n');
         sb.append("Available processors: ").append(Runtime.getRuntime().availableProcessors()).append('\n');
-        sb.append("Minecraft: ").append(String.valueOf(net.minecraft.SharedConstants.getCurrentVersion())).append('\n');
+        try {
+            sb.append("Minecraft: ").append(net.minecraft.SharedConstants.getCurrentVersion()).append('\n');
+        } catch (Throwable t) {
+            sb.append("Minecraft: (unavailable)\n");
+        }
         try {
             sb.append("Fabric Loader: ").append(FabricLoader.getInstance().getModContainer("fabricloader")
                     .map(c -> c.getMetadata().getVersion().getFriendlyString()).orElse("?")).append('\n');
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            sb.append("Fabric Loader: ?\n");
         }
         sb.append('\n');
 
@@ -69,17 +74,19 @@ public final class ReportWriter {
         MemoryUsage heap = mem.getHeapMemoryUsage();
         MemoryUsage nonHeap = mem.getNonHeapMemoryUsage();
         sb.append(String.format("Heap used: %s / %s (committed %s)\n",
-                humanBytes(heap.getUsed()), humanBytes(heap.getMax()), humanBytes(heap.getCommitted())));
+                humanBytes(heap.getUsed()),
+                humanBytes(heap.getMax() > 0 ? heap.getMax() : heap.getCommitted()),
+                humanBytes(heap.getCommitted())));
         sb.append(String.format("Non-heap used: %s / committed %s\n",
                 humanBytes(nonHeap.getUsed()), humanBytes(nonHeap.getCommitted())));
-        long totalGcTime = 0;
         long totalGcCount = 0;
+        long totalGcTime = 0;
         for (GarbageCollectorMXBean gc : ManagementFactory.getGarbageCollectorMXBeans()) {
-            long t = gc.getCollectionTime();
             long c = gc.getCollectionCount();
-            if (t >= 0) totalGcTime += t;
+            long tm = gc.getCollectionTime();
             if (c >= 0) totalGcCount += c;
-            sb.append(String.format("GC %s: count=%d time=%dms\n", gc.getName(), c, t));
+            if (tm >= 0) totalGcTime += tm;
+            sb.append(String.format("GC %s: count=%d time=%dms\n", gc.getName(), c, tm));
         }
         sb.append(String.format("Total GC: count=%d time=%dms\n\n", totalGcCount, totalGcTime));
 
@@ -111,11 +118,13 @@ public final class ReportWriter {
         sb.append(String.format("Min frame time: %.3f ms\n", sampler.getMinFrameMs()));
         sb.append(String.format("Max frame time: %.3f ms\n", sampler.getMaxFrameMs()));
         double avgFps = sampler.getAvgFrameMs() > 0 ? 1000.0 / sampler.getAvgFrameMs() : 0;
-        sb.append(String.format("Approx avg FPS during session: %.1f\n\n", avgFps));
+        sb.append(String.format("Approx avg FPS during session: %.1f\n", avgFps));
+        sb.append(String.format("Spike threshold: >= %d ms\n\n", sampler.getSpikeThresholdMs()));
 
-        sb.append("### HOTTEST MODS (by stack sample attribution)\n");
-        sb.append("Higher hit count ≈ more time spent in that mod's code on the client thread.\n");
-        sb.append("Note: statistical sampling – treat as relative ranking, not absolute %.\n\n");
+        sb.append("### HOTTEST MODS (attributed, infrastructure rolled up)\n");
+        sb.append("Higher hit count ≈ more relative client-thread time.\n");
+        sb.append("lwjgl/java frames are attributed to the calling mod when possible.\n");
+        sb.append("Per-mod RAM cannot be measured accurately without a full heap dump.\n\n");
         Map<String, Long> modHits = sampler.getModHitCounts();
         long totalHits = modHits.values().stream().mapToLong(Long::longValue).sum();
         List<Map.Entry<String, Long>> sortedMods = new ArrayList<>(modHits.entrySet());
@@ -125,6 +134,58 @@ public final class ReportWriter {
             double pct = totalHits > 0 ? (e.getValue() * 100.0 / totalHits) : 0;
             sb.append(String.format("%2d. %-32s  hits=%6d  (~%.1f%%)\n",
                     rank++, e.getKey(), e.getValue(), pct));
+        }
+        sb.append('\n');
+
+        sb.append("### HOTTEST MODS (raw top-of-stack, includes lwjgl)\n");
+        Map<String, Long> rawHits = sampler.getModHitCountsRaw();
+        long totalRaw = rawHits.values().stream().mapToLong(Long::longValue).sum();
+        List<Map.Entry<String, Long>> sortedRaw = new ArrayList<>(rawHits.entrySet());
+        sortedRaw.sort(Comparator.comparingLong((Map.Entry<String, Long> e) -> e.getValue()).reversed());
+        rank = 1;
+        for (Map.Entry<String, Long> e : sortedRaw) {
+            double pct = totalRaw > 0 ? (e.getValue() * 100.0 / totalRaw) : 0;
+            sb.append(String.format("%2d. %-32s  hits=%6d  (~%.1f%%)\n",
+                    rank++, e.getKey(), e.getValue(), pct));
+            if (rank > 15) break;
+        }
+        sb.append('\n');
+
+        sb.append("### FRAME SPIKES (>= threshold)\n");
+        sb.append("Captured near the slow frame using the latest async stack sample.\n\n");
+        List<SampleCollector.SpikeRecord> spikes = sampler.getSpikes();
+        if (spikes.isEmpty()) {
+            sb.append("(no spikes captured)\n");
+        } else {
+            int spikeLimit = Math.min(20, spikes.size());
+            for (int i = spikes.size() - spikeLimit; i < spikes.size(); i++) {
+                SampleCollector.SpikeRecord sp = spikes.get(i);
+                sb.append(String.format("t=%dms  frame=%.1fms  mod=%s\n  %s\n",
+                        sp.sessionMs(), sp.frameMs(), sp.attributedMod(),
+                        sp.stackSummary().isEmpty() ? "(no stack)" : sp.stackSummary()));
+            }
+        }
+        sb.append('\n');
+
+        sb.append("### MEMORY TIMELINE (heap, not per-mod)\n");
+        sb.append("JVM does not expose accurate per-mod RAM without a heap dump.\n");
+        sb.append("These samples show total heap and GC activity during the session.\n\n");
+        List<SampleCollector.MemorySample> memSamples = sampler.getMemorySamples();
+        if (memSamples.isEmpty()) {
+            sb.append("(no memory samples)\n");
+        } else {
+            for (SampleCollector.MemorySample m : memSamples) {
+                double pct = m.heapMax() > 0 ? (m.heapUsed() * 100.0 / m.heapMax()) : 0;
+                sb.append(String.format(
+                        "t=%dms  used=%s  committed=%s  max=%s  (%.0f%%)  gcCountΔ=%d  gcTimeΔ=%dms\n",
+                        m.sessionMs(),
+                        humanBytes(m.heapUsed()),
+                        humanBytes(m.heapCommitted()),
+                        humanBytes(m.heapMax()),
+                        pct,
+                        m.gcCountDelta(),
+                        m.gcTimeMsDelta()));
+            }
         }
         sb.append('\n');
 
@@ -162,29 +223,31 @@ public final class ReportWriter {
 
         sb.append("### ENTITY COUNTS BY TYPE (top 30)\n");
         Map<String, Integer> byType = EntityModStats.countEntitiesByType(client);
-        List<Map.Entry<String, Integer>> sortedType = new ArrayList<>(byType.entrySet());
-        sortedType.sort(Comparator.comparingInt((Map.Entry<String, Integer> e) -> e.getValue()).reversed());
-        int tLimit = Math.min(30, sortedType.size());
+        List<Map.Entry<String, Integer>> sortedEntType = new ArrayList<>(byType.entrySet());
+        sortedEntType.sort(Comparator.comparingInt((Map.Entry<String, Integer> e) -> e.getValue()).reversed());
+        int tLimit = Math.min(30, sortedEntType.size());
         for (int i = 0; i < tLimit; i++) {
-            Map.Entry<String, Integer> e = sortedType.get(i);
-            sb.append(String.format("  %-50s  %5d\n", e.getKey(), e.getValue()));
+            Map.Entry<String, Integer> e = sortedEntType.get(i);
+            sb.append(String.format("  %-40s  %5d\n", e.getKey(), e.getValue()));
         }
         sb.append('\n');
 
         sb.append("### PARTICLES & CHUNKS\n");
         try {
-            Object raw = client.particleEngine.countParticles();
-            sb.append("Particles: ").append(raw).append('\n');
+            Object pe = client.particleEngine;
+            Object count = pe.getClass().getMethod("countParticles").invoke(pe);
+            sb.append("Particles: ").append(count).append('\n');
         } catch (Throwable t) {
-            sb.append("Particles: (unavailable)\n");
+            sb.append("Particles: ?\n");
         }
+        int rendered = safeCountRenderedChunks(client);
+        sb.append("Chunks rendered: ").append(rendered).append('\n');
         try {
-            int rendered = safeCountRenderedChunks(client);
-            int loaded = client.level != null ? client.level.getChunkSource().getLoadedChunksCount() : -1;
-            sb.append("Chunks rendered: ").append(rendered).append('\n');
-            sb.append("Chunks loaded: ").append(loaded).append('\n');
+            if (client.level != null) {
+                sb.append("Chunks loaded: ").append(client.level.getChunkSource().getLoadedChunksCount()).append('\n');
+            }
         } catch (Throwable t) {
-            sb.append("Chunks: (unavailable)\n");
+            sb.append("Chunks loaded: ?\n");
         }
         sb.append('\n');
 
@@ -197,13 +260,12 @@ public final class ReportWriter {
         sb.append('\n');
 
         sb.append("### ANALYSIS HINTS\n");
-        sb.append("- Look at HOTTEST MODS first. Mods with high sample % and high entity counts are prime suspects.\n");
-        sb.append("- If 'minecraft' or 'java' dominate, the issue may be vanilla load, render distance, or GC pressure.\n");
-        sb.append("- High particle counts often come from particle-heavy mods, fireworks, potions, or shaders.\n");
-        sb.append("- Sudden max frame spikes with low average may indicate GC pauses or chunk loading stalls.\n");
-        sb.append("- Compare this report with another taken after disabling the top 1-3 suspect mods.\n");
-        sb.append("- GPU overheating is often caused by shaders (Iris/Oculus), high render distance, or unlimited FPS.\n");
-        sb.append("- This report is designed so you can paste the whole file to an AI for interpretation.\n");
+        sb.append("- Use attributed HOTTEST MODS for ranking; raw list still shows lwjgl when GPU-bound.\n");
+        sb.append("- FRAME SPIKES show what was on the client thread near slow frames.\n");
+        sb.append("- MEMORY TIMELINE is total heap only; per-mod RAM needs a heap dump tool.\n");
+        sb.append("- If minecraft dominates, lower render distance or reduce world/entity load.\n");
+        sb.append("- GPU heat on mobile: lower max FPS, render distance, minimap, and heavy HUD modules.\n");
+        sb.append("- Compare reports after disabling the top 1-3 attributed mods.\n");
         sb.append("================================================================================\n");
 
         try {

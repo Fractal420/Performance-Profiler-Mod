@@ -2,7 +2,10 @@ package com.example.perfprofiler.profiler;
 
 import com.example.perfprofiler.util.ModResolver;
 
+import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryUsage;
 import java.lang.management.ThreadInfo;
 import java.lang.management.ThreadMXBean;
 import java.util.ArrayList;
@@ -12,40 +15,66 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 
 public class SampleCollector {
     private final ThreadMXBean threadMx = ManagementFactory.getThreadMXBean();
+    private final MemoryMXBean memoryMx = ManagementFactory.getMemoryMXBean();
 
     private final Map<String, LongAdder> modHits = new ConcurrentHashMap<>();
+    private final Map<String, LongAdder> modHitsRaw = new ConcurrentHashMap<>();
     private final Map<String, LongAdder> methodHits = new ConcurrentHashMap<>();
     private final List<String> recentStacks = new ArrayList<>();
+    private final List<SpikeRecord> spikes = new ArrayList<>();
+    private final List<MemorySample> memorySamples = new ArrayList<>();
     private static final int MAX_RECENT_STACKS = 40;
+    private static final int MAX_SPIKES = 30;
+    private static final int MAX_MEMORY_SAMPLES = 60;
 
     private final AtomicLong totalSamples = new AtomicLong();
     private final AtomicLong totalFrameNs = new AtomicLong();
     private final AtomicLong frameCount = new AtomicLong();
     private final AtomicLong maxFrameNs = new AtomicLong();
     private final AtomicLong minFrameNs = new AtomicLong(Long.MAX_VALUE);
+    private final AtomicReference<String> latestStackSummary = new AtomicReference<>("");
+    private final AtomicReference<String> latestAttributedMod = new AtomicReference<>("unknown");
 
     private volatile boolean running = false;
     private volatile Thread clientThread;
     private Thread samplerThread;
+    private long sessionStartNs;
+    private long lastMemorySampleNs;
+    private long startGcCount;
+    private long startGcTimeMs;
 
     private static final long SAMPLE_SLEEP_MS = 5L;
+    private static final long MEMORY_SAMPLE_INTERVAL_NS = 500_000_000L;
+    private static final long SPIKE_THRESHOLD_NS = 40_000_000L;
 
     public void start() {
         stopSamplerThread();
         running = true;
         modHits.clear();
+        modHitsRaw.clear();
         methodHits.clear();
         recentStacks.clear();
+        spikes.clear();
+        memorySamples.clear();
         totalSamples.set(0);
         totalFrameNs.set(0);
         frameCount.set(0);
         maxFrameNs.set(0);
         minFrameNs.set(Long.MAX_VALUE);
+        latestStackSummary.set("");
+        latestAttributedMod.set("unknown");
+        sessionStartNs = System.nanoTime();
+        lastMemorySampleNs = 0;
+        long[] gc = readGc();
+        startGcCount = gc[0];
+        startGcTimeMs = gc[1];
         ModResolver.rebuild();
+        recordMemorySample();
         samplerThread = new Thread(this::samplerLoop, "perfprofiler-sampler");
         samplerThread.setDaemon(true);
         samplerThread.setPriority(Thread.MAX_PRIORITY);
@@ -54,6 +83,7 @@ public class SampleCollector {
 
     public void stop() {
         running = false;
+        recordMemorySample();
         stopSamplerThread();
     }
 
@@ -84,6 +114,20 @@ public class SampleCollector {
         frameCount.incrementAndGet();
         maxFrameNs.accumulateAndGet(frameDurationNs, Math::max);
         minFrameNs.accumulateAndGet(frameDurationNs, Math::min);
+
+        if (frameDurationNs >= SPIKE_THRESHOLD_NS) {
+            synchronized (spikes) {
+                if (spikes.size() >= MAX_SPIKES) {
+                    spikes.remove(0);
+                }
+                spikes.add(new SpikeRecord(
+                        (System.nanoTime() - sessionStartNs) / 1_000_000L,
+                        frameDurationNs / 1_000_000.0,
+                        latestAttributedMod.get(),
+                        latestStackSummary.get()
+                ));
+            }
+        }
     }
 
     private void samplerLoop() {
@@ -96,6 +140,11 @@ public class SampleCollector {
                         processStack(info.getStackTrace());
                     }
                 }
+                long now = System.nanoTime();
+                if (now - lastMemorySampleNs >= MEMORY_SAMPLE_INTERVAL_NS) {
+                    lastMemorySampleNs = now;
+                    recordMemorySample();
+                }
                 Thread.sleep(SAMPLE_SLEEP_MS);
             } catch (InterruptedException e) {
                 break;
@@ -104,50 +153,96 @@ public class SampleCollector {
         }
     }
 
+    private void recordMemorySample() {
+        try {
+            MemoryUsage heap = memoryMx.getHeapMemoryUsage();
+            long[] gc = readGc();
+            synchronized (memorySamples) {
+                if (memorySamples.size() >= MAX_MEMORY_SAMPLES) {
+                    memorySamples.remove(0);
+                }
+                memorySamples.add(new MemorySample(
+                        (System.nanoTime() - sessionStartNs) / 1_000_000L,
+                        heap.getUsed(),
+                        heap.getCommitted(),
+                        heap.getMax() > 0 ? heap.getMax() : heap.getCommitted(),
+                        gc[0] - startGcCount,
+                        gc[1] - startGcTimeMs
+                ));
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static long[] readGc() {
+        long count = 0;
+        long time = 0;
+        for (GarbageCollectorMXBean bean : ManagementFactory.getGarbageCollectorMXBeans()) {
+            long c = bean.getCollectionCount();
+            long t = bean.getCollectionTime();
+            if (c > 0) count += c;
+            if (t > 0) time += t;
+        }
+        return new long[]{count, time};
+    }
+
     private void processStack(StackTraceElement[] stack) {
         totalSamples.incrementAndGet();
 
-        String attributedMod = "unknown";
+        List<FrameInfo> frames = new ArrayList<>();
         StringBuilder stackSummary = new StringBuilder();
         int depth = 0;
-        boolean attributed = false;
 
         for (StackTraceElement el : stack) {
             String cn = el.getClassName();
             String mn = el.getMethodName();
-
             if (isNoiseFrame(cn, mn)) continue;
             if (depth++ > 32) break;
 
             String mod = resolveMod(cn, mn);
-            String methodKey = mod + "|" + simpleName(cn) + "." + mn;
-            methodHits.computeIfAbsent(methodKey, k -> new LongAdder()).increment();
-
-            if (!attributed) {
-                if (isPreferMod(mod)) {
-                    attributedMod = mod;
-                    attributed = true;
-                } else if ("unknown".equals(attributedMod) || "java".equals(attributedMod)) {
-                    attributedMod = mod;
-                }
-            }
+            frames.add(new FrameInfo(mod, cn, mn));
+            methodHits.computeIfAbsent(mod + "|" + simpleName(cn) + "." + mn, k -> new LongAdder()).increment();
 
             if (stackSummary.length() > 0) stackSummary.append(" <- ");
             stackSummary.append(simpleName(cn)).append('.').append(mn);
         }
 
-        if (!attributed && ("unknown".equals(attributedMod) || attributedMod.isEmpty())) {
-            attributedMod = "minecraft";
-        }
+        String rawMod = frames.isEmpty() ? "unknown" : frames.get(0).mod;
+        String attributedMod = attributeMod(frames);
 
+        modHitsRaw.computeIfAbsent(rawMod, k -> new LongAdder()).increment();
         modHits.computeIfAbsent(attributedMod, k -> new LongAdder()).increment();
+
+        String summary = stackSummary.toString();
+        latestStackSummary.set(summary);
+        latestAttributedMod.set(attributedMod);
 
         synchronized (recentStacks) {
             if (recentStacks.size() >= MAX_RECENT_STACKS) {
                 recentStacks.remove(0);
             }
-            recentStacks.add(attributedMod + " :: " + stackSummary);
+            recentStacks.add(attributedMod + " :: " + summary);
         }
+    }
+
+    private static String attributeMod(List<FrameInfo> frames) {
+        String fallback = "minecraft";
+        for (FrameInfo f : frames) {
+            if (isPreferMod(f.mod)) return f.mod;
+            if (!isInfrastructure(f.mod)) {
+                if ("unknown".equals(fallback) || "java".equals(fallback) || isInfrastructure(fallback)) {
+                    fallback = f.mod;
+                }
+            }
+        }
+        for (FrameInfo f : frames) {
+            if (!"java".equals(f.mod) && !isInfrastructure(f.mod)) return f.mod;
+        }
+        return frames.isEmpty() ? "unknown" : frames.get(0).mod;
+    }
+
+    private static boolean isInfrastructure(String mod) {
+        return "lwjgl".equals(mod) || "java".equals(mod) || "jdk".equals(mod);
     }
 
     private static String resolveMod(String className, String methodName) {
@@ -189,13 +284,13 @@ public class SampleCollector {
         if (className.startsWith("java.lang.invoke.Invokers")) return true;
         if ("getStackTrace".equals(methodName)) return true;
         if ("getThreadInfo".equals(methodName) || "getThreadInfo1".equals(methodName)) return true;
-        if (className.contains("perfprofiler-sampler")) return true;
         return false;
     }
 
     private static boolean isPreferMod(String mod) {
         if (mod == null) return false;
-        if ("java".equals(mod) || "minecraft".equals(mod) || "fabric".equals(mod) || "lwjgl".equals(mod)) return false;
+        if (isInfrastructure(mod)) return false;
+        if ("minecraft".equals(mod) || "fabric".equals(mod)) return false;
         if ("unknown".equals(mod) || "unknown-mod".equals(mod)) return false;
         if ("perfprofiler".equals(mod)) return false;
         return true;
@@ -212,6 +307,12 @@ public class SampleCollector {
         return out;
     }
 
+    public Map<String, Long> getModHitCountsRaw() {
+        Map<String, Long> out = new HashMap<>();
+        modHitsRaw.forEach((k, v) -> out.put(k, v.sum()));
+        return out;
+    }
+
     public Map<String, Long> getMethodHitCounts() {
         Map<String, Long> out = new HashMap<>();
         methodHits.forEach((k, v) -> out.put(k, v.sum()));
@@ -221,6 +322,18 @@ public class SampleCollector {
     public List<String> getRecentStacks() {
         synchronized (recentStacks) {
             return new ArrayList<>(recentStacks);
+        }
+    }
+
+    public List<SpikeRecord> getSpikes() {
+        synchronized (spikes) {
+            return new ArrayList<>(spikes);
+        }
+    }
+
+    public List<MemorySample> getMemorySamples() {
+        synchronized (memorySamples) {
+            return new ArrayList<>(memorySamples);
         }
     }
 
@@ -245,5 +358,18 @@ public class SampleCollector {
     public double getMinFrameMs() {
         long v = minFrameNs.get();
         return v == Long.MAX_VALUE ? 0 : v / 1_000_000.0;
+    }
+
+    public long getSpikeThresholdMs() {
+        return SPIKE_THRESHOLD_NS / 1_000_000L;
+    }
+
+    public record SpikeRecord(long sessionMs, double frameMs, String attributedMod, String stackSummary) {
+    }
+
+    public record MemorySample(long sessionMs, long heapUsed, long heapCommitted, long heapMax, long gcCountDelta, long gcTimeMsDelta) {
+    }
+
+    private record FrameInfo(String mod, String className, String methodName) {
     }
 }
