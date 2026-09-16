@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "perfprofiler",
+  "version": "${version}",
+  "name": "Performance Profiler",
+  "icon": "assets/perfprofiler/icon.png",
+  "description": "Find which mods cause FPS drops and overheating. Stack sampling, entity/particle stats, memory/GC, and detailed reports written to config/perfprofiler/reports/ (no chat spam).",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.example.perfprofiler.PerformanceProfilerClient"
+    ],
+    "modmenu": [
+      "com.example.perfprofiler.integration.ModMenuIntegration"
+    ]
+  },
+  "mixins": [
+    "perfprofiler.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.17.0",
+    "minecraft": "~${minecraft_version}",
+    "java": ">=21",
+    "fabric-api": "*"
+  },
+  "suggests": {
+    "modmenu": "*"
+  }
+}

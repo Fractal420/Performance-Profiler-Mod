@@ -1,0 +1,7 @@
+{
+  "key.categories.perfprofiler": "Performance Profiler",
+  "key.perfprofiler.toggle_hud": "Toggle HUD",
+  "key.perfprofiler.toggle_profile": "Start/Stop Profiling Session",
+  "key.perfprofiler.write_report": "Write Report Snapshot",
+  "key.perfprofiler.open_config": "Open Config"
+}
