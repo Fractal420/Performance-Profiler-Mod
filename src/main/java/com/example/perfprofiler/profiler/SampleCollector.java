@@ -25,12 +25,15 @@ public class SampleCollector {
     private final Map<String, LongAdder> modHits = new ConcurrentHashMap<>();
     private final Map<String, LongAdder> modHitsRaw = new ConcurrentHashMap<>();
     private final Map<String, LongAdder> methodHits = new ConcurrentHashMap<>();
+    private final Map<String, LongAdder> moduleHits = new ConcurrentHashMap<>();
+    private final Map<String, LongAdder> categoryHits = new ConcurrentHashMap<>();
+    private final Map<String, LongAdder> frameBuckets = new ConcurrentHashMap<>();
     private final List<String> recentStacks = new ArrayList<>();
     private final List<SpikeRecord> spikes = new ArrayList<>();
     private final List<MemorySample> memorySamples = new ArrayList<>();
     private static final int MAX_RECENT_STACKS = 40;
-    private static final int MAX_SPIKES = 30;
-    private static final int MAX_MEMORY_SAMPLES = 60;
+    private static final int MAX_SPIKES = 40;
+    private static final int MAX_MEMORY_SAMPLES = 80;
 
     private final AtomicLong totalSamples = new AtomicLong();
     private final AtomicLong totalFrameNs = new AtomicLong();
@@ -39,6 +42,8 @@ public class SampleCollector {
     private final AtomicLong minFrameNs = new AtomicLong(Long.MAX_VALUE);
     private final AtomicReference<String> latestStackSummary = new AtomicReference<>("");
     private final AtomicReference<String> latestAttributedMod = new AtomicReference<>("unknown");
+    private final AtomicReference<String> latestModule = new AtomicReference<>("");
+    private final AtomicReference<String> latestCategory = new AtomicReference<>("other");
 
     private volatile boolean running = false;
     private volatile Thread clientThread;
@@ -58,6 +63,9 @@ public class SampleCollector {
         modHits.clear();
         modHitsRaw.clear();
         methodHits.clear();
+        moduleHits.clear();
+        categoryHits.clear();
+        frameBuckets.clear();
         recentStacks.clear();
         spikes.clear();
         memorySamples.clear();
@@ -68,6 +76,8 @@ public class SampleCollector {
         minFrameNs.set(Long.MAX_VALUE);
         latestStackSummary.set("");
         latestAttributedMod.set("unknown");
+        latestModule.set("");
+        latestCategory.set("other");
         sessionStartNs = System.nanoTime();
         lastMemorySampleNs = 0;
         long[] gc = readGc();
@@ -115,6 +125,9 @@ public class SampleCollector {
         maxFrameNs.accumulateAndGet(frameDurationNs, Math::max);
         minFrameNs.accumulateAndGet(frameDurationNs, Math::min);
 
+        double ms = frameDurationNs / 1_000_000.0;
+        frameBuckets.computeIfAbsent(bucketLabel(ms), k -> new LongAdder()).increment();
+
         if (frameDurationNs >= SPIKE_THRESHOLD_NS) {
             synchronized (spikes) {
                 if (spikes.size() >= MAX_SPIKES) {
@@ -122,12 +135,25 @@ public class SampleCollector {
                 }
                 spikes.add(new SpikeRecord(
                         (System.nanoTime() - sessionStartNs) / 1_000_000L,
-                        frameDurationNs / 1_000_000.0,
+                        ms,
                         latestAttributedMod.get(),
+                        latestModule.get(),
+                        latestCategory.get(),
                         latestStackSummary.get()
                 ));
             }
         }
+    }
+
+    private static String bucketLabel(double ms) {
+        if (ms < 8) return "0-8ms (120+ FPS)";
+        if (ms < 12) return "8-12ms (83-120 FPS)";
+        if (ms < 16.7) return "12-16.7ms (60-83 FPS)";
+        if (ms < 25) return "16.7-25ms (40-60 FPS)";
+        if (ms < 40) return "25-40ms (25-40 FPS)";
+        if (ms < 80) return "40-80ms (stutter)";
+        if (ms < 200) return "80-200ms (hitch)";
+        return "200ms+ (severe)";
     }
 
     private void samplerLoop() {
@@ -135,7 +161,7 @@ public class SampleCollector {
             try {
                 Thread target = clientThread;
                 if (target != null && target.isAlive()) {
-                    ThreadInfo info = threadMx.getThreadInfo(target.getId(), 64);
+                    ThreadInfo info = threadMx.getThreadInfo(target.getId(), 72);
                     if (info != null && info.getStackTrace() != null && info.getStackTrace().length > 0) {
                         processStack(info.getStackTrace());
                     }
@@ -192,16 +218,28 @@ public class SampleCollector {
         List<FrameInfo> frames = new ArrayList<>();
         StringBuilder stackSummary = new StringBuilder();
         int depth = 0;
+        String bestModule = null;
+        String category = "other";
 
         for (StackTraceElement el : stack) {
             String cn = el.getClassName();
             String mn = el.getMethodName();
             if (isNoiseFrame(cn, mn)) continue;
-            if (depth++ > 32) break;
+            if (depth++ > 40) break;
 
             String mod = resolveMod(cn, mn);
             frames.add(new FrameInfo(mod, cn, mn));
             methodHits.computeIfAbsent(mod + "|" + simpleName(cn) + "." + mn, k -> new LongAdder()).increment();
+
+            String module = detectModule(cn, mn);
+            if (module != null && bestModule == null) {
+                bestModule = module;
+            }
+
+            String cat = detectCategory(cn, mn);
+            if (!"other".equals(cat) && "other".equals(category)) {
+                category = cat;
+            }
 
             if (stackSummary.length() > 0) stackSummary.append(" <- ");
             stackSummary.append(simpleName(cn)).append('.').append(mn);
@@ -209,20 +247,135 @@ public class SampleCollector {
 
         String rawMod = frames.isEmpty() ? "unknown" : frames.get(0).mod;
         String attributedMod = attributeMod(frames);
+        if (bestModule == null) {
+            bestModule = "";
+        }
 
         modHitsRaw.computeIfAbsent(rawMod, k -> new LongAdder()).increment();
         modHits.computeIfAbsent(attributedMod, k -> new LongAdder()).increment();
+        categoryHits.computeIfAbsent(category, k -> new LongAdder()).increment();
+        if (!bestModule.isEmpty()) {
+            moduleHits.computeIfAbsent(bestModule, k -> new LongAdder()).increment();
+        }
 
         String summary = stackSummary.toString();
         latestStackSummary.set(summary);
         latestAttributedMod.set(attributedMod);
+        latestModule.set(bestModule);
+        latestCategory.set(category);
 
         synchronized (recentStacks) {
             if (recentStacks.size() >= MAX_RECENT_STACKS) {
                 recentStacks.remove(0);
             }
-            recentStacks.add(attributedMod + " :: " + summary);
+            String label = attributedMod;
+            if (!bestModule.isEmpty()) {
+                label = label + " [" + bestModule + "]";
+            }
+            recentStacks.add(label + " /" + category + "/ :: " + summary);
         }
+    }
+
+    private static String detectModule(String className, String methodName) {
+        String cn = className;
+        String lower = cn.toLowerCase(Locale.ROOT);
+
+        if (cn.contains("meteordevelopment.meteorclient.systems.modules")
+                || cn.contains("meteordevelopment.meteorclient.systems.hud")
+                || cn.contains("meteordevelopment.meteorclient.renderer")
+                || cn.contains("meteordevelopment.meteorclient.utils.render")) {
+            return "meteor:" + simpleName(cn);
+        }
+        if (lower.contains("meteor") && (lower.contains("module") || lower.contains("addon"))) {
+            return "meteor:" + simpleName(cn);
+        }
+
+        if (lower.contains("baritone")) {
+            return "baritone:" + simpleName(cn);
+        }
+        if (lower.contains("blackout")) {
+            return "blackout:" + simpleName(cn);
+        }
+        if (lower.contains("meteorplus") || lower.contains("meteor.plus")) {
+            return "meteorplus:" + simpleName(cn);
+        }
+        if (lower.contains("higtools")) {
+            return "higtools:" + simpleName(cn);
+        }
+        if (lower.contains("trouser") || lower.contains("streak")) {
+            return "streak:" + simpleName(cn);
+        }
+        if (lower.contains("litematica") || lower.contains("malilib")) {
+            if (lower.contains("overlay") || lower.contains("render") || lower.contains("schematic")) {
+                return "litematica:" + simpleName(cn);
+            }
+        }
+        if (lower.contains("xaero")) {
+            if (lower.contains("minimap") || lower.contains("radar")) return "xaero:minimap:" + simpleName(cn);
+            if (lower.contains("worldmap") || lower.contains("mapprocessor") || lower.contains("mapregion")) {
+                return "xaero:worldmap:" + simpleName(cn);
+            }
+            return "xaero:" + simpleName(cn);
+        }
+        if (lower.contains("iris") || lower.contains("irisshaders")) {
+            return "iris:" + simpleName(cn);
+        }
+        if (lower.contains("sodium") && (lower.contains("render") || lower.contains("chunk") || lower.contains("section"))) {
+            return "sodium:" + simpleName(cn);
+        }
+
+        String mixinMod = modFromMixinName(methodName);
+        if (mixinMod != null && methodName != null) {
+            int idx = methodName.lastIndexOf('$');
+            if (idx > 0 && idx + 1 < methodName.length()) {
+                String tail = methodName.substring(idx + 1);
+                if (tail.length() > 2 && !tail.startsWith("mixinextras")) {
+                    return mixinMod + ":" + tail;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static String detectCategory(String className, String methodName) {
+        String c = className.toLowerCase(Locale.ROOT);
+        String m = methodName == null ? "" : methodName.toLowerCase(Locale.ROOT);
+        if (c.contains("particle") || m.contains("particle")) return "particles";
+        if (c.contains("minimap") || c.contains("worldmap") || c.contains("mapprocessor") || c.contains("mapregion")) {
+            return "maps";
+        }
+        if (c.contains("gui") || c.contains("screen") || c.contains("hud") || c.contains("inGameHud".toLowerCase())
+                || m.contains("flushguistate") || m.contains("onrender") && c.contains("class_329")) {
+            return "gui_hud";
+        }
+        if (c.contains("overlay") || c.contains("schematic") || c.contains("litematica") || c.contains("malilib")) {
+            return "world_overlay";
+        }
+        if (c.contains("tracer") || c.contains("esp") || c.contains("renderer3d") || c.contains("outline")
+                || c.contains("waypoint") || c.contains("storageesp") || c.contains("holeesp")) {
+            return "esp_tracers";
+        }
+        if (c.contains("chunk") || c.contains("terrain") || c.contains("section") || c.contains("sodium")
+                || c.contains("levelrenderer") || c.contains("class_761")) {
+            return "terrain";
+        }
+        if (c.contains("entity") || c.contains("livingentity") || c.contains("class_897") || c.contains("class_898")) {
+            return "entities";
+        }
+        if (m.contains("tick") || c.contains("tick") || m.contains("ontick") || m.contains("ontick")) {
+            return "tick";
+        }
+        if (c.contains("gl") || c.contains("lwjgl") || c.contains("glfw") || c.contains("opengl")
+                || m.contains("buffer") || m.contains("draw")) {
+            return "gpu_submit";
+        }
+        if (c.contains("path") || c.contains("baritone") || c.contains("goal")) {
+            return "pathfinding";
+        }
+        if (c.contains("network") || c.contains("packet") || c.contains("connection")) {
+            return "network";
+        }
+        return "other";
     }
 
     private static String attributeMod(List<FrameInfo> frames) {
@@ -298,7 +451,10 @@ public class SampleCollector {
 
     private static String simpleName(String className) {
         int i = className.lastIndexOf('.');
-        return i >= 0 ? className.substring(i + 1) : className;
+        String n = i >= 0 ? className.substring(i + 1) : className;
+        int d = n.indexOf('$');
+        if (d > 0) n = n.substring(0, d);
+        return n;
     }
 
     public Map<String, Long> getModHitCounts() {
@@ -316,6 +472,24 @@ public class SampleCollector {
     public Map<String, Long> getMethodHitCounts() {
         Map<String, Long> out = new HashMap<>();
         methodHits.forEach((k, v) -> out.put(k, v.sum()));
+        return out;
+    }
+
+    public Map<String, Long> getModuleHitCounts() {
+        Map<String, Long> out = new HashMap<>();
+        moduleHits.forEach((k, v) -> out.put(k, v.sum()));
+        return out;
+    }
+
+    public Map<String, Long> getCategoryHitCounts() {
+        Map<String, Long> out = new HashMap<>();
+        categoryHits.forEach((k, v) -> out.put(k, v.sum()));
+        return out;
+    }
+
+    public Map<String, Long> getFrameBucketCounts() {
+        Map<String, Long> out = new HashMap<>();
+        frameBuckets.forEach((k, v) -> out.put(k, v.sum()));
         return out;
     }
 
@@ -364,7 +538,7 @@ public class SampleCollector {
         return SPIKE_THRESHOLD_NS / 1_000_000L;
     }
 
-    public record SpikeRecord(long sessionMs, double frameMs, String attributedMod, String stackSummary) {
+    public record SpikeRecord(long sessionMs, double frameMs, String attributedMod, String module, String category, String stackSummary) {
     }
 
     public record MemorySample(long sessionMs, long heapUsed, long heapCommitted, long heapMax, long gcCountDelta, long gcTimeMsDelta) {

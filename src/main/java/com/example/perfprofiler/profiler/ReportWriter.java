@@ -1,5 +1,6 @@
 package com.example.perfprofiler.profiler;
 
+import com.example.perfprofiler.util.MeteorProbe;
 import com.example.perfprofiler.util.ModResolver;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
@@ -137,6 +138,71 @@ public final class ReportWriter {
         }
         sb.append('\n');
 
+        sb.append("### HOTTEST MODULES / FEATURES (from stack class names)\n");
+        sb.append("Examples: meteor:Tracers, xaero:minimap:..., litematica:OverlayRenderer\n");
+        sb.append("This is the best signal for which Meteor module or addon feature is hot.\n\n");
+        Map<String, Long> moduleHits = sampler.getModuleHitCounts();
+        long totalModu = moduleHits.values().stream().mapToLong(Long::longValue).sum();
+        List<Map.Entry<String, Long>> sortedModules = new ArrayList<>(moduleHits.entrySet());
+        sortedModules.sort(Comparator.comparingLong((Map.Entry<String, Long> e) -> e.getValue()).reversed());
+        rank = 1;
+        if (sortedModules.isEmpty()) {
+            sb.append("(no module-level frames captured)\n");
+        } else {
+            int mLimit = Math.min(40, sortedModules.size());
+            for (int i = 0; i < mLimit; i++) {
+                Map.Entry<String, Long> e = sortedModules.get(i);
+                double pct = totalModu > 0 ? (e.getValue() * 100.0 / totalModu) : 0;
+                sb.append(String.format("%2d. %-48s  hits=%6d  (~%.1f%%)\n",
+                        rank++, e.getKey(), e.getValue(), pct));
+            }
+        }
+        sb.append('\n');
+
+        sb.append("### WORKLOAD CATEGORIES\n");
+        sb.append("Rough classification of what the client thread was doing.\n\n");
+        Map<String, Long> cats = sampler.getCategoryHitCounts();
+        long totalCat = cats.values().stream().mapToLong(Long::longValue).sum();
+        List<Map.Entry<String, Long>> sortedCats = new ArrayList<>(cats.entrySet());
+        sortedCats.sort(Comparator.comparingLong((Map.Entry<String, Long> e) -> e.getValue()).reversed());
+        for (Map.Entry<String, Long> e : sortedCats) {
+            double pct = totalCat > 0 ? (e.getValue() * 100.0 / totalCat) : 0;
+            sb.append(String.format("  %-16s  hits=%6d  (~%.1f%%)\n", e.getKey(), e.getValue(), pct));
+        }
+        sb.append('\n');
+
+        sb.append("### FRAME TIME HISTOGRAM\n");
+        Map<String, Long> buckets = sampler.getFrameBucketCounts();
+        long totalFramesBucket = buckets.values().stream().mapToLong(Long::longValue).sum();
+        String[] order = {
+                "0-8ms (120+ FPS)",
+                "8-12ms (83-120 FPS)",
+                "12-16.7ms (60-83 FPS)",
+                "16.7-25ms (40-60 FPS)",
+                "25-40ms (25-40 FPS)",
+                "40-80ms (stutter)",
+                "80-200ms (hitch)",
+                "200ms+ (severe)"
+        };
+        for (String key : order) {
+            long v = buckets.getOrDefault(key, 0L);
+            double pct = totalFramesBucket > 0 ? (v * 100.0 / totalFramesBucket) : 0;
+            sb.append(String.format("  %-24s  %6d  (~%.1f%%)\n", key, v, pct));
+        }
+        sb.append('\n');
+
+        sb.append("### METEOR MODULES CURRENTLY ACTIVE\n");
+        List<String> enabled = MeteorProbe.listEnabledModules();
+        if (enabled.isEmpty()) {
+            sb.append("(Meteor not present, or could not reflect modules)\n");
+        } else {
+            sb.append("Count: ").append(enabled.size()).append('\n');
+            for (String name : enabled) {
+                sb.append("  - ").append(name).append('\n');
+            }
+        }
+        sb.append('\n');
+
         sb.append("### HOTTEST MODS (raw top-of-stack, includes lwjgl)\n");
         Map<String, Long> rawHits = sampler.getModHitCountsRaw();
         long totalRaw = rawHits.values().stream().mapToLong(Long::longValue).sum();
@@ -160,8 +226,10 @@ public final class ReportWriter {
             int spikeLimit = Math.min(20, spikes.size());
             for (int i = spikes.size() - spikeLimit; i < spikes.size(); i++) {
                 SampleCollector.SpikeRecord sp = spikes.get(i);
-                sb.append(String.format("t=%dms  frame=%.1fms  mod=%s\n  %s\n",
+                sb.append(String.format("t=%dms  frame=%.1fms  mod=%s  module=%s  cat=%s\n  %s\n",
                         sp.sessionMs(), sp.frameMs(), sp.attributedMod(),
+                        sp.module().isEmpty() ? "-" : sp.module(),
+                        sp.category(),
                         sp.stackSummary().isEmpty() ? "(no stack)" : sp.stackSummary()));
             }
         }
@@ -260,12 +328,12 @@ public final class ReportWriter {
         sb.append('\n');
 
         sb.append("### ANALYSIS HINTS\n");
-        sb.append("- Use attributed HOTTEST MODS for ranking; raw list still shows lwjgl when GPU-bound.\n");
-        sb.append("- FRAME SPIKES show what was on the client thread near slow frames.\n");
-        sb.append("- MEMORY TIMELINE is total heap only; per-mod RAM needs a heap dump tool.\n");
-        sb.append("- If minecraft dominates, lower render distance or reduce world/entity load.\n");
-        sb.append("- GPU heat on mobile: lower max FPS, render distance, minimap, and heavy HUD modules.\n");
-        sb.append("- Compare reports after disabling the top 1-3 attributed mods.\n");
+        sb.append("- HOTTEST MODULES names Meteor/Xaero/Litematica features seen on the stack.\n");
+        sb.append("- METEOR MODULES ACTIVE lists what is enabled right now (reflection).\n");
+        sb.append("- WORKLOAD CATEGORIES and FRAME HISTOGRAM show stutter vs steady load.\n");
+        sb.append("- FRAME SPIKES include module + category near slow frames.\n");
+        sb.append("- Per-mod RAM is not available without a heap dump.\n");
+        sb.append("- GPU heat on mobile: lower max FPS, RD, minimap, Tracers/ESP.\n");
         sb.append("================================================================================\n");
 
         try {
