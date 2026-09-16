@@ -95,6 +95,15 @@ public final class ModResolver {
         if (lower.contains("modernfix")) return "modernfix";
         if (lower.contains("optifine")) return "optifine";
         if (lower.contains("rubidium")) return "rubidium";
+        if (lower.contains("meteor")) return "meteor-client";
+        if (lower.contains("baritone")) return "baritone-meteor";
+        if (lower.contains("xaerominimap") || lower.contains("xaero.minimap")) return "xaerominimap";
+        if (lower.contains("xaeroworldmap") || lower.contains("xaero.worldmap")) return "xaeroworldmap";
+        if (lower.contains("litematica")) return "litematica";
+        if (lower.contains("malilib")) return "malilib";
+        if (lower.contains("immediatelyfast")) return "immediatelyfast";
+        if (lower.contains("zoomify")) return "zoomify";
+        if (lower.contains("wthit") || lower.contains("jade")) return "wthit";
         return "unknown-mod";
     }
 
